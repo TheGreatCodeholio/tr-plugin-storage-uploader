@@ -31,6 +31,7 @@ This installs `libstorage_uploader.so` to TR's plugin library path.
       "systems": [
         {
           "shortName": "chemung",
+          "audio": "auto",
           "uploadJson": true,
           "deleteAfterUpload": true,
           "s3": {
@@ -42,6 +43,7 @@ This installs `libstorage_uploader.so` to TR's plugin library path.
         },
         {
           "shortName": "steuben",
+          "audio": "both",
           "uploadJson": true,
           "deleteAfterUpload": false,
           "sftp": {
