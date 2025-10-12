@@ -26,7 +26,7 @@
 #include "sftp_client.hpp"
 
 // Trunk-Recorder headers (adjust include path if needed)
-#include "plugins/plugin_api.h"   // plugin_t, Call_Data_t, etc.
+#include "trunk-recorder/plugin_manager/plugin_api.h"   // plugin_t, Call_Data_t, etc.
 
 using boost::property_tree::ptree;
 namespace fs = std::filesystem;
