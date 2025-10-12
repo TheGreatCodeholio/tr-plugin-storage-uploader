@@ -1,0 +1,19 @@
+
+# Build artifacts
+/build/
+/CMakeFiles/
+/cmake-build-*/
+CMakeCache.txt
+compile_commands.json
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.pdb
+*.pch
+*.vcxproj*
+*.sln
+.DS_Store

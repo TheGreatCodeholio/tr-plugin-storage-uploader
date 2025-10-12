@@ -1,0 +1,35 @@
+
+{
+  "plugins": [
+    {
+      "name": "Storage Uploader",
+      "library": "libstorage_uploader_rdio.so",
+      "systems": [
+        {
+          "shortName": "chemung",
+          "uploadJson": true,
+          "deleteAfterUpload": true,
+          "s3": {
+            "enabled": true,
+            "bucket": "chemung-calls",
+            "region": "us-east-1",
+            "prefix_template": "chemung/{yyyy}/{MM}/{dd}/{basename}"
+          }
+        },
+        {
+          "shortName": "steuben",
+          "uploadJson": true,
+          "deleteAfterUpload": false,
+          "sftp": {
+            "enabled": true,
+            "host": "sftp.steuben.net",
+            "port": 22,
+            "username": "upload",
+            "remote_root": "/srv/steuben/calls",
+            "prefix_template": "steuben/{yyyy}/{MM}/{dd}/{basename}"
+          }
+        }
+      ]
+    }
+  ]
+}
