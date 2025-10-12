@@ -3,7 +3,7 @@
   "plugins": [
     {
       "name": "Storage Uploader",
-      "library": "libstorage_uploader_rdio.so",
+      "library": "libstorage_uploader.so",
       "systems": [
         {
           "shortName": "chemung",
