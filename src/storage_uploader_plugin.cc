@@ -306,7 +306,7 @@ public:
     try {
       UploadJob job;
       job.audio_path = choose_audio_path_from_call(call_info);
-      job.json_path  = call_info.statusfilename;
+      job.json_path  = call_info.status_filename;
       job.shortName  = call_info.short_name;           // NOTE: TR field name
       job.startTime  = (std::time_t)call_info.start_time; // NOTE: TR field name
       if (uploader_) uploader_->enqueue(job);
