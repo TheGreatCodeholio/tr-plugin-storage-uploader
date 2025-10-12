@@ -8,6 +8,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <curl/curl.h>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -18,17 +19,21 @@
 #include <vector>
 #include <iostream>
 
-#include <boost/property_tree/ptree.hpp>
+
+#include <boost/property_tree/ptree.hpp>   // (no longer used for parse_config, harmless to keep)
+#include <json.hpp>
+#include <boost/dll/alias.hpp>
 
 #include "config.hpp"
 #include "util.hpp"
 #include "s3_client.hpp"
 #include "sftp_client.hpp"
 
-// Trunk-Recorder headers (adjust include path if needed)
-#include "trunk-recorder/plugin_manager/plugin_api.h"   // plugin_t, Call_Data_t, etc.
+// Trunk-Recorder headers
+#include <trunk-recorder/plugin_manager/plugin_api.h>
 
 using boost::property_tree::ptree;
+using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 // ---------------- data passed to worker ----------------
@@ -201,124 +206,126 @@ static std::string choose_audio_path_from_call(const Call_Data_t& call) {
     return call.filename;
 }
 
-// ---------------- required plugin entry points -----------
+// ---------------- class-based plugin (Plugin_Api) ---------------
 
-extern "C" {
+class Storage_Uploader_Plugin : public Plugin_Api {
+public:
+  Storage_Uploader_Plugin() = default;
+  ~Storage_Uploader_Plugin() override = default;
 
-plugin_t* storage_uploader_plugin_new() {
-    plugin_t* plugin = new plugin_t();
-    plugin->name = (char*)"Storage Uploader";
+  // RDIO-style per-system config (JSON)
+  int parse_config(json config_data) override {
+    try {
+      g_cfg_by_system.clear();
 
-    // Parse RDIO-style per-system config
-    plugin->parse_config = [](plugin_t* /*p*/, ptree::value_type &cfg)->int {
-        try {
-            g_cfg_by_system.clear();
+      if (!config_data.contains("systems") || !config_data["systems"].is_array()) {
+        std::cerr << "[storage-uploader] plugin config missing \"systems\" array\n";
+        return -1;
+      }
 
-            // Expect an array at "systems"
-            auto systems_opt = cfg.second.get_child_optional("systems");
-            if (!systems_opt) {
-                std::cerr << "[storage-uploader] plugin config missing \"systems\" array" << std::endl;
-                return -1;
-            }
-
-            for (auto& node : *systems_opt) {
-                const ptree& el = node.second;
-
-                std::string shortName = el.get<std::string>("shortName", "");
-                if (shortName.empty()) {
-                    std::cerr << "[storage-uploader] system entry missing shortName — skipping" << std::endl;
-                    continue;
-                }
-
-                PluginConfig pc; // defaults from config.hpp
-
-                pc.upload_json         = el.get<bool>("uploadJson", true);
-                pc.delete_after_upload = el.get<bool>("deleteAfterUpload", false);
-                pc.log_debug           = el.get<bool>("debug", false);
-
-                // S3 block
-                if (auto s3 = el.get_child_optional("s3")) {
-                    pc.s3.enabled            = s3->get<bool>("enabled", false);
-                    pc.s3.bucket             = s3->get<std::string>("bucket", "");
-                    pc.s3.region             = s3->get<std::string>("region", "us-east-1");
-                    pc.s3.endpoint           = s3->get<std::string>("endpoint", "");
-                    pc.s3.prefix_template    = s3->get<std::string>("prefix_template", pc.s3.prefix_template);
-                    pc.s3.access_key         = s3->get<std::string>("access_key", "");
-                    pc.s3.secret_key         = s3->get<std::string>("secret_key", "");
-                    if (auto v = s3->get_optional<std::string>("session_token")) pc.s3.session_token = *v;
-                    if (auto v = s3->get_optional<std::string>("storage_class")) pc.s3.storage_class = *v;
-                    if (auto v = s3->get_optional<std::string>("acl"))           pc.s3.acl = *v;
-                    if (auto v = s3->get_optional<std::string>("sse"))           pc.s3.sse = *v;
-                    if (auto v = s3->get_optional<std::string>("kms_key"))       pc.s3.kms_key = *v;
-                    pc.s3.connect_timeout_ms  = s3->get<long>("connect_timeout_ms", 10000);
-                    pc.s3.transfer_timeout_ms = s3->get<long>("transfer_timeout_ms", 0);
-                    pc.s3.max_retries         = s3->get<int>("max_retries", 5);
-                }
-
-                // SFTP block
-                if (auto sf = el.get_child_optional("sftp")) {
-                    pc.sftp.enabled           = sf->get<bool>("enabled", false);
-                    pc.sftp.host              = sf->get<std::string>("host", "");
-                    pc.sftp.port              = sf->get<int>("port", 22);
-                    pc.sftp.username          = sf->get<std::string>("username", "");
-                    pc.sftp.password          = sf->get<std::string>("password", "");
-                    pc.sftp.key_path          = sf->get<std::string>("key_path", "");
-                    pc.sftp.known_hosts       = sf->get<std::string>("known_hosts", "");
-                    pc.sftp.remote_root       = sf->get<std::string>("remote_root", "/uploads");
-                    pc.sftp.prefix_template   = sf->get<std::string>("prefix_template", pc.sftp.prefix_template);
-                    pc.sftp.connect_timeout_ms  = sf->get<long>("connect_timeout_ms", 10000);
-                    pc.sftp.transfer_timeout_ms = sf->get<long>("transfer_timeout_ms", 0);
-                    pc.sftp.max_retries         = sf->get<int>("max_retries", 5);
-                }
-
-                g_cfg_by_system.emplace(shortName, std::move(pc));
-            }
-
-            if (g_cfg_by_system.empty()) {
-                std::cerr << "[storage-uploader] no valid systems configured" << std::endl;
-                return -1;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[storage-uploader] parse_config error: " << e.what() << std::endl;
-            return -1;
+      for (const auto& el : config_data["systems"]) {
+        std::string shortName = el.value("shortName", "");
+        if (shortName.empty()) {
+          std::cerr << "[storage-uploader] system entry missing shortName — skipping\n";
+          continue;
         }
-        return 0;
-    };
 
-    plugin->init = [](plugin_t* /*p*/)->int {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        g_uploader = new StorageUploader(g_cfg_by_system);
-        g_uploader->start();
-        return 0;
-    };
+        PluginConfig pc; // defaults from config.hpp
+        pc.upload_json         = el.value("uploadJson", true);
+        pc.delete_after_upload = el.value("deleteAfterUpload", false);
+        pc.log_debug           = el.value("debug", false);
 
-    plugin->start = [](plugin_t* /*p*/)->int { return 0; };
-
-    plugin->stop = [](plugin_t* /*p*/)->int {
-        if (g_uploader) {
-            g_uploader->stop();
-            delete g_uploader;
-            g_uploader = nullptr;
+        if (el.contains("s3")) {
+          const auto& s3 = el["s3"];
+          pc.s3.enabled            = s3.value("enabled", false);
+          pc.s3.bucket             = s3.value("bucket", "");
+          pc.s3.region             = s3.value("region", "us-east-1");
+          pc.s3.endpoint           = s3.value("endpoint", "");
+          pc.s3.prefix_template    = s3.value("prefix_template", pc.s3.prefix_template);
+          pc.s3.access_key         = s3.value("access_key", "");
+          pc.s3.secret_key         = s3.value("secret_key", "");
+          if (s3.contains("session_token"))  pc.s3.session_token  = s3["session_token"].get<std::string>();
+          if (s3.contains("storage_class"))  pc.s3.storage_class  = s3["storage_class"].get<std::string>();
+          if (s3.contains("acl"))            pc.s3.acl            = s3["acl"].get<std::string>();
+          if (s3.contains("sse"))            pc.s3.sse            = s3["sse"].get<std::string>();
+          if (s3.contains("kms_key"))        pc.s3.kms_key        = s3["kms_key"].get<std::string>();
+          pc.s3.connect_timeout_ms  = s3.value("connect_timeout_ms", 10000L);
+          pc.s3.transfer_timeout_ms = s3.value("transfer_timeout_ms", 0L);
+          pc.s3.max_retries         = s3.value("max_retries", 5);
         }
-        curl_global_cleanup();
-        return 0;
-    };
 
-    plugin->call_end = [](plugin_t* /*p*/, Call_Data_t call)->int {
-        try {
-            UploadJob job;
-            job.audio_path = choose_audio_path_from_call(call); // prefer converted if present
-            job.json_path  = call.statusfilename;
-            job.shortName  = call.shortName;
-            job.startTime  = (std::time_t)call.startTime;
-            if (g_uploader) g_uploader->enqueue(job);
-        } catch (...) {
-            return -1;
+        if (el.contains("sftp")) {
+          const auto& sf = el["sftp"];
+          pc.sftp.enabled           = sf.value("enabled", false);
+          pc.sftp.host              = sf.value("host", "");
+          pc.sftp.port              = sf.value("port", 22);
+          pc.sftp.username          = sf.value("username", "");
+          pc.sftp.password          = sf.value("password", "");
+          pc.sftp.key_path          = sf.value("key_path", "");
+          pc.sftp.known_hosts       = sf.value("known_hosts", "");
+          pc.sftp.remote_root       = sf.value("remote_root", "/uploads");
+          pc.sftp.prefix_template   = sf.value("prefix_template", pc.sftp.prefix_template);
+          pc.sftp.connect_timeout_ms  = sf.value("connect_timeout_ms", 10000L);
+          pc.sftp.transfer_timeout_ms = sf.value("transfer_timeout_ms", 0L);
+          pc.sftp.max_retries         = sf.value("max_retries", 5);
         }
-        return 0;
-    };
 
-    return plugin;
-}
+        g_cfg_by_system.emplace(shortName, std::move(pc));
+      }
 
-} // extern "C"
+      if (g_cfg_by_system.empty()) {
+        std::cerr << "[storage-uploader] no valid systems configured\n";
+        return -1;
+      }
+      return 0;
+    } catch (const std::exception& e) {
+      std::cerr << "[storage-uploader] parse_config error: " << e.what() << "\n";
+      return -1;
+    }
+  }
+
+  int init(Config* /*cfg*/, std::vector<Source*>, std::vector<System*>) override {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    uploader_ = std::make_unique<StorageUploader>(g_cfg_by_system);
+    uploader_->start();
+    return 0;
+  }
+
+  int start() override { return 0; }
+
+  int stop() override {
+    if (uploader_) {
+      uploader_->stop();
+      uploader_.reset();
+    }
+    curl_global_cleanup();
+    return 0;
+  }
+
+  int call_end(Call_Data_t call_info) override {
+    try {
+      UploadJob job;
+      job.audio_path = choose_audio_path_from_call(call_info);
+      job.json_path  = call_info.statusfilename;
+      job.shortName  = call_info.short_name;           // NOTE: TR field name
+      job.startTime  = (std::time_t)call_info.start_time; // NOTE: TR field name
+      if (uploader_) uploader_->enqueue(job);
+    } catch (...) {
+      return -1;
+    }
+    return 0;
+  }
+
+  static boost::shared_ptr<Storage_Uploader_Plugin> create() {
+    return boost::shared_ptr<Storage_Uploader_Plugin>(new Storage_Uploader_Plugin());
+  }
+
+private:
+  std::unique_ptr<StorageUploader> uploader_;
+};
+
+// Export factory symbol expected by TR’s plugin manager (like MQTT)
+BOOST_DLL_ALIAS(
+  Storage_Uploader_Plugin::create,
+  create_plugin
+)
