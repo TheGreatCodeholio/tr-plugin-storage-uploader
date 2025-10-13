@@ -1,4 +1,4 @@
-// Storage Uploader plugin (RDIO-style config, async worker)
+// Storage Uploader plugin
 // Uploads finished files to S3 and/or SFTP per-system, selected by shortName.
 // - Per-system "audio" control: "auto" (default), "m4a", "wav", "all"
 // - "auto": prefer .m4a if present, else .wav
@@ -29,8 +29,8 @@
 #include <algorithm> // tolower
 #include <boost/log/trivial.hpp>
 
-#include <boost/dll/alias.hpp>          // <<< CHANGED: for BOOST_DLL_ALIAS
-#include <json.hpp>                     // <<< CHANGED: json in class-based API
+#include <boost/dll/alias.hpp>
+#include <json.hpp>
 
 #include "config.hpp"
 #include "util.hpp"
@@ -357,6 +357,11 @@ public:
                     pc.sftp.connect_timeout_ms  = sf.value("connect_timeout_ms", 10000L);
                     pc.sftp.transfer_timeout_ms = sf.value("transfer_timeout_ms", 0L);
                     pc.sftp.max_retries         = sf.value("max_retries", 5);
+
+                    pc.sftp.accept_unknown_host =
+                        sf.value("accept_unknown_host",
+                        sf.value("auto_accept_unknown_host",
+                        sf.value("insecure_accept_unknown_host", false)));
                 }
 
                 const bool s3_on   = pc.s3.enabled;
@@ -381,7 +386,8 @@ public:
                         << "[" << shortName << "] SFTP: "
                         << pc.sftp.host << ":" << pc.sftp.port
                         << " root=" << pc.sftp.remote_root
-                        << " prefix=\"" << pc.sftp.prefix_template << "\"";
+                        << " prefix=\"" << pc.sftp.prefix_template << "\""
+                        << " accept_unknown_host=" << (pc.sftp.accept_unknown_host ? "on" : "off");
                 }
 
                 cfg_by_system_.emplace(shortName, std::move(pc));

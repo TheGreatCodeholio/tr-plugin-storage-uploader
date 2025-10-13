@@ -41,6 +41,7 @@ struct SftpConfig {
     long connect_timeout_ms{10000};      // Connect timeout
     long transfer_timeout_ms{0};         // 0 = unlimited transfer time
     int max_retries{5};                  // Exponential backoff retries
+    bool accept_unknown_host{false};
 };
 
 /**
