@@ -27,6 +27,7 @@
 #include <vector>
 #include <iostream>
 #include <algorithm> // tolower
+#include <boost/log/trivial.hpp>
 
 #include <boost/dll/alias.hpp>          // <<< CHANGED: for BOOST_DLL_ALIAS
 #include <json.hpp>                     // <<< CHANGED: json in class-based API
@@ -43,6 +44,9 @@
 
 using json = nlohmann::json; // <<< CHANGED: convenience alias
 namespace fs = std::filesystem;
+
+static constexpr const char* SU_TAG = "\t[Storage Uploader]\t";
+#define SU_LOG(sev) BOOST_LOG_TRIVIAL(sev) << SU_TAG
 
 // ---------------- Small helpers ----------------
 
@@ -134,8 +138,7 @@ private:
             // Lookup system by shortName
             auto it = systems_.find(job.shortName);
             if (it == systems_.end()) {
-                std::cerr << "[storage-uploader] no config for system '"
-                          << job.shortName << "' — skipping upload\n";
+                SU_LOG(warning) << "[" << job.shortName << "] no per-system config — skipping upload";
                 continue;
             }
             SystemCtx* sys = it->second.get();
@@ -158,13 +161,13 @@ private:
                 if      (has_m4a) audio_files.push_back(job.m4a_path);
                 else if (has_wav) {
                     audio_files.push_back(job.wav_path);
-                    std::cerr << "[storage-uploader] m4a requested but not found; falling back to wav\n";
+                    SU_LOG(warning) << "[" << job.shortName << "] m4a requested but not found; falling back to wav";
                 }
             } else if (mode == "wav") {
                 if      (has_wav) audio_files.push_back(job.wav_path);
                 else if (has_m4a) {
                     audio_files.push_back(job.m4a_path);
-                    std::cerr << "[storage-uploader] wav requested but not found; falling back to m4a\n";
+                    SU_LOG(warning) << "[" << job.shortName << "] wav requested but not found; falling back to m4a";
                 }
             } else { // "auto" (default)
                 if      (has_m4a) audio_files.push_back(job.m4a_path);
@@ -172,8 +175,7 @@ private:
             }
 
             if (audio_files.empty()) {
-                std::cerr << "[storage-uploader] no audio file present for system '"
-                          << job.shortName << "' — skipping\n";
+                SU_LOG(warning) << "[" << job.shortName << "] no audio file present — skipping";
                 continue;
             }
 
@@ -194,14 +196,13 @@ private:
                     std::string err;
                     if (fn(&err)) return true;
                     if (attempt >= max_retries) {
-                        std::cerr << "[storage-uploader] " << label
-                                  << " failed after " << (attempt+1)
-                                  << " attempts: " << err << "\n";
+                        SU_LOG(error) << "[" << job.shortName << "] " << label
+                                      << " failed after " << (attempt + 1) << " attempts: " << err;
                         return false;
                     }
                     int backoff = (1 << attempt);
-                    std::cerr << "[storage-uploader] " << label << " failed: " << err
-                              << " — retrying in " << backoff << "s\n";
+                    SU_LOG(warning) << "[" << job.shortName << "] " << label
+                                    << " failed: " << err << " — retrying in " << backoff << "s";
                     std::this_thread::sleep_for(std::chrono::seconds(backoff));
                     attempt++;
                 }
@@ -224,6 +225,9 @@ private:
                         cfg.s3.max_retries,
                         "s3 audio: " + base);
                 }
+                if (ok && cfg.log_debug) {
+                    SU_LOG(info) << "[" << job.shortName << "] uploaded (S3): " << base;
+                }
                 if (!ok) break;
 
                 if (cfg.sftp.enabled) {
@@ -231,6 +235,9 @@ private:
                         [&](std::string* e){ return sys->sftp->upload_file(audio_path, sftp_rel, e); },
                         cfg.sftp.max_retries,
                         "sftp audio: " + base);
+                }
+                if (ok && cfg.log_debug) {
+                    SU_LOG(info) << "[" << job.shortName << "] uploaded (SFTP): " << base;
                 }
                 if (!ok) break;
             }
@@ -249,6 +256,10 @@ private:
                         cfg.sftp.max_retries,
                         "sftp json");
                 }
+                if (ok && cfg.upload_json && file_exists(job.json_path) && cfg.log_debug) {
+                    SU_LOG(info) << "[" << job.shortName << "] uploaded metadata JSON: "
+                                 << basename_of(job.json_path);
+                }
             }
 
             // Optional cleanup
@@ -256,6 +267,10 @@ private:
                 std::error_code ec;
                 for (const auto& p : audio_files) fs::remove(p, ec);
                 if (cfg.upload_json) fs::remove(job.json_path, ec);
+            }
+
+            if (ok && cfg.delete_after_upload && cfg.log_debug) {
+                SU_LOG(info) << "[" << job.shortName << "] deleted local files after upload";
             }
         }
     }
@@ -283,16 +298,17 @@ public:
     // RDIO-style: we expect a "systems" array inside this plugin block.
     int parse_config(json config_data) override {            // <<< CHANGED
         try {
+            SU_LOG(info) << "Parsing plugin config...";
             cfg_by_system_.clear();
 
             if (!config_data.contains("systems") || !config_data["systems"].is_array()) {
-                std::cerr << "[storage-uploader] plugin config missing \"systems\" array\n";
+                SU_LOG(error) << "plugin config missing \"systems\" array";
                 return -1;
             }
 
             for (const auto& el : config_data["systems"]) {
                 if (!el.contains("shortName")) {
-                    std::cerr << "[storage-uploader] system entry missing shortName — skipping\n";
+                    SU_LOG(warning) << "system entry missing shortName — skipping";
                     continue;
                 }
                 std::string shortName = el.value("shortName", "");
@@ -343,17 +359,44 @@ public:
                     pc.sftp.max_retries         = sf.value("max_retries", 5);
                 }
 
+                const bool s3_on   = pc.s3.enabled;
+                const bool sftp_on = pc.sftp.enabled;
+
+                SU_LOG(info)
+                    << "[" << shortName << "] "
+                    << "audio=" << pc.audio
+                    << " json=" << (pc.upload_json ? "on" : "off")
+                    << " deleteAfterUpload=" << (pc.delete_after_upload ? "on" : "off");
+
+                if (s3_on) {
+                    SU_LOG(info)
+                        << "[" << shortName << "] S3: "
+                        << "bucket=" << pc.s3.bucket
+                        << " region=" << pc.s3.region
+                        << " endpoint=" << (pc.s3.endpoint.empty() ? "(default)" : pc.s3.endpoint)
+                        << " prefix=\"" << pc.s3.prefix_template << "\"";
+                }
+                if (sftp_on) {
+                    SU_LOG(info)
+                        << "[" << shortName << "] SFTP: "
+                        << pc.sftp.host << ":" << pc.sftp.port
+                        << " root=" << pc.sftp.remote_root
+                        << " prefix=\"" << pc.sftp.prefix_template << "\"";
+                }
+
                 cfg_by_system_.emplace(shortName, std::move(pc));
             }
 
             if (cfg_by_system_.empty()) {
-                std::cerr << "[storage-uploader] no valid systems configured\n";
+                SU_LOG(error) << "no valid systems configured";
                 return -1;
             }
         } catch (const std::exception& e) {
-            std::cerr << "[storage-uploader] parse_config error: " << e.what() << "\n";
+            SU_LOG(error) << "parse_config error: " << e.what();
             return -1;
         }
+        SU_LOG(info) << "Loaded " << cfg_by_system_.size() << " system config"
+             << (cfg_by_system_.size() == 1 ? "" : "s") << ".";
         return 0;
     }
 
@@ -361,6 +404,7 @@ public:
     int init(Config* /*config*/,
              std::vector<Source*> /*sources*/,
              std::vector<System*> /*systems*/) override {    // <<< CHANGED
+        SU_LOG(info) << "Initializing (curl + worker)...";
         curl_global_init(CURL_GLOBAL_DEFAULT);
         worker_ = std::make_unique<StorageUploaderWorker>(cfg_by_system_);
         worker_->start();
@@ -368,15 +412,18 @@ public:
     }
 
     int start() override {                                    // <<< CHANGED
+        SU_LOG(info) << "Worker started.";
         return 0;
     }
 
     int stop() override {                                     // <<< CHANGED
+        SU_LOG(info) << "Stopping worker...";
         if (worker_) {
             worker_->stop();
             worker_.reset();
         }
         curl_global_cleanup();
+        SU_LOG(info) << "Worker Stopped.";
         return 0;
     }
 
@@ -389,6 +436,11 @@ public:
             job.json_path  = call_info.status_filename;   // NOTE: status_filename (correct)
             job.shortName  = call_info.short_name;        // system shortName
             job.startTime  = static_cast<std::time_t>(call_info.start_time);
+            SU_LOG(info) << "[" << job.shortName << "] queue upload: "
+             << "wav=" << basename_of(job.wav_path)
+             << " m4a=" << basename_of(job.m4a_path)
+             << " json=" << basename_of(job.json_path);
+
             if (worker_) worker_->enqueue(job);
         } catch (...) {
             return -1;
