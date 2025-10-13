@@ -26,19 +26,20 @@
 #include <memory>
 #include <vector>
 #include <iostream>
-#include <algorithm> // std::transform (lowercasing)
+#include <algorithm> // tolower
 
-#include <boost/property_tree/ptree.hpp>
+#include <boost/dll/alias.hpp>          // <<< CHANGED: for BOOST_DLL_ALIAS
+#include <json.hpp>                     // <<< CHANGED: json in class-based API
 
 #include "config.hpp"
 #include "util.hpp"
 #include "s3_client.hpp"
 #include "sftp_client.hpp"
 
-// TR plugin API (function-pointer style)
-#include <trunk-recorder/plugin_manager/plugin_api.h>
+// TR plugin API (class-based, like MQTT)
+#include <trunk-recorder/plugin_manager/plugin_api.h>   // <<< CHANGED
 
-using boost::property_tree::ptree;
+using json = nlohmann::json; // <<< CHANGED: convenience alias
 namespace fs = std::filesystem;
 
 // ---------------- Small helpers ----------------
@@ -86,9 +87,9 @@ struct SystemCtx {
 
 // ---------------- Worker with async queue ----------------
 
-class StorageUploader {
+class StorageUploaderWorker {
 public:
-    explicit StorageUploader(const std::unordered_map<std::string, PluginConfig>& by_system) {
+    explicit StorageUploaderWorker(const std::unordered_map<std::string, PluginConfig>& by_system) {
         for (const auto& kv : by_system) {
             systems_.emplace(kv.first, std::make_unique<SystemCtx>(kv.second));
         }
@@ -177,15 +178,14 @@ private:
             // Prepare JSON keys/paths up-front
             std::string s3_json_key, sftp_json_rel;
             if (cfg.upload_json && file_exists(job.json_path)) {
-                const std::string json_base =
-                    basename_of(job.json_path);
+                const std::string json_base = basename_of(job.json_path);
                 s3_json_key   = substitute_template(cfg.s3.prefix_template,
                                                     job.shortName, job.startTime, json_base);
                 sftp_json_rel = substitute_template(cfg.sftp.prefix_template,
                                                     job.shortName, job.startTime, json_base);
             }
 
-            // Retry wrapper: label is std::string to avoid dangling c_str()
+            // Retry wrapper
             auto try_with_retries = [&](auto fn, int max_retries, const std::string& label) {
                 int attempt = 0;
                 for (;;) {
@@ -209,8 +209,7 @@ private:
 
             // Upload each chosen audio file
             for (const auto& audio_path : audio_files) {
-                const std::string base =
-                    basename_of(audio_path);
+                const std::string base = basename_of(audio_path);
 
                 const std::string s3_key   =
                     substitute_template(cfg.s3.prefix_template,   job.shortName, job.startTime, base);
@@ -270,88 +269,82 @@ private:
     bool stop_flag_{false};
 };
 
-// ---------------- Plugin globals ----------------
+// =======================
+//  Plugin class (NEW)   // <<< CHANGED: class-based API like MQTT
+// =======================
 
-static std::unordered_map<std::string, PluginConfig> g_cfg_by_system;
-static StorageUploader* g_uploader = nullptr;
+class Storage_Uploader_Plugin : public Plugin_Api {
+public:
+    Storage_Uploader_Plugin() = default;
 
-// ---------------- Required plugin entry points ----------------
-
-extern "C" {
-
-plugin_t* storage_uploader_plugin_new() {
-    plugin_t* plugin = new plugin_t();
-    plugin->name = (char*)"Storage Uploader";
-
-    // Parse RDIO-style per-system config array at plugins[].systems[]
-    plugin->parse_config = [](plugin_t* /*p*/, ptree::value_type &cfg)->int {
+    // parse_config(json)
+    // RDIO-style: we expect a "systems" array inside this plugin block.
+    int parse_config(json config_data) override {            // <<< CHANGED
         try {
-            g_cfg_by_system.clear();
+            cfg_by_system_.clear();
 
-            auto systems_opt = cfg.second.get_child_optional("systems");
-            if (!systems_opt) {
+            if (!config_data.contains("systems") || !config_data["systems"].is_array()) {
                 std::cerr << "[storage-uploader] plugin config missing \"systems\" array\n";
                 return -1;
             }
 
-            for (auto& node : *systems_opt) {
-                const ptree& el = node.second;
-
-                std::string shortName = el.get<std::string>("shortName", "");
-                if (shortName.empty()) {
+            for (const auto& el : config_data["systems"]) {
+                if (!el.contains("shortName")) {
                     std::cerr << "[storage-uploader] system entry missing shortName — skipping\n";
                     continue;
                 }
+                std::string shortName = el.value("shortName", "");
+                if (shortName.empty()) continue;
 
                 PluginConfig pc; // defaults from config.hpp
 
-                // General flags
-                pc.upload_json         = el.get<bool>("uploadJson", true);
-                pc.delete_after_upload = el.get<bool>("deleteAfterUpload", false);
-                pc.log_debug           = el.get<bool>("debug", false);
-
-                // Audio mode (auto/m4a/wav/all); store lowercase
-                pc.audio               = to_lower_copy(el.get<std::string>("audio", "auto"));
+                // General
+                pc.upload_json         = el.value("uploadJson", true);
+                pc.delete_after_upload = el.value("deleteAfterUpload", false);
+                pc.log_debug           = el.value("debug", false);
+                pc.audio               = to_lower_copy(el.value("audio", "auto"));
 
                 // S3 block
-                if (auto s3 = el.get_child_optional("s3")) {
-                    pc.s3.enabled              = s3->get<bool>("enabled", false);
-                    pc.s3.bucket               = s3->get<std::string>("bucket", "");
-                    pc.s3.region               = s3->get<std::string>("region", "us-east-1");
-                    pc.s3.endpoint             = s3->get<std::string>("endpoint", "");
-                    pc.s3.prefix_template      = s3->get<std::string>("prefix_template", pc.s3.prefix_template);
-                    pc.s3.access_key           = s3->get<std::string>("access_key", "");
-                    pc.s3.secret_key           = s3->get<std::string>("secret_key", "");
-                    if (auto v = s3->get_optional<std::string>("session_token")) pc.s3.session_token = *v;
-                    if (auto v = s3->get_optional<std::string>("storage_class")) pc.s3.storage_class = *v;
-                    if (auto v = s3->get_optional<std::string>("acl"))           pc.s3.acl = *v;
-                    if (auto v = s3->get_optional<std::string>("sse"))           pc.s3.sse = *v;
-                    if (auto v = s3->get_optional<std::string>("kms_key"))       pc.s3.kms_key = *v;
-                    pc.s3.connect_timeout_ms    = s3->get<long>("connect_timeout_ms", 10000);
-                    pc.s3.transfer_timeout_ms   = s3->get<long>("transfer_timeout_ms", 0);
-                    pc.s3.max_retries           = s3->get<int>("max_retries", 5);
+                if (el.contains("s3")) {
+                    const auto& s3 = el["s3"];
+                    pc.s3.enabled            = s3.value("enabled", false);
+                    pc.s3.bucket             = s3.value("bucket", "");
+                    pc.s3.region             = s3.value("region", "us-east-1");
+                    pc.s3.endpoint           = s3.value("endpoint", "");
+                    pc.s3.prefix_template    = s3.value("prefix_template", pc.s3.prefix_template);
+                    pc.s3.access_key         = s3.value("access_key", "");
+                    pc.s3.secret_key         = s3.value("secret_key", "");
+                    if (s3.contains("session_token")) pc.s3.session_token = s3.value("session_token", "");
+                    if (s3.contains("storage_class")) pc.s3.storage_class = s3.value("storage_class", "");
+                    if (s3.contains("acl"))           pc.s3.acl           = s3.value("acl", "");
+                    if (s3.contains("sse"))           pc.s3.sse           = s3.value("sse", "");
+                    if (s3.contains("kms_key"))       pc.s3.kms_key       = s3.value("kms_key", "");
+                    pc.s3.connect_timeout_ms  = s3.value("connect_timeout_ms", 10000L);
+                    pc.s3.transfer_timeout_ms = s3.value("transfer_timeout_ms", 0L);
+                    pc.s3.max_retries         = s3.value("max_retries", 5);
                 }
 
                 // SFTP block
-                if (auto sf = el.get_child_optional("sftp")) {
-                    pc.sftp.enabled             = sf->get<bool>("enabled", false);
-                    pc.sftp.host                = sf->get<std::string>("host", "");
-                    pc.sftp.port                = sf->get<int>("port", 22);
-                    pc.sftp.username            = sf->get<std::string>("username", "");
-                    pc.sftp.password            = sf->get<std::string>("password", "");
-                    pc.sftp.key_path            = sf->get<std::string>("key_path", "");
-                    pc.sftp.known_hosts         = sf->get<std::string>("known_hosts", "");
-                    pc.sftp.remote_root         = sf->get<std::string>("remote_root", "/uploads");
-                    pc.sftp.prefix_template     = sf->get<std::string>("prefix_template", pc.sftp.prefix_template);
-                    pc.sftp.connect_timeout_ms  = sf->get<long>("connect_timeout_ms", 10000);
-                    pc.sftp.transfer_timeout_ms = sf->get<long>("transfer_timeout_ms", 0);
-                    pc.sftp.max_retries         = sf->get<int>("max_retries", 5);
+                if (el.contains("sftp")) {
+                    const auto& sf = el["sftp"];
+                    pc.sftp.enabled           = sf.value("enabled", false);
+                    pc.sftp.host              = sf.value("host", "");
+                    pc.sftp.port              = sf.value("port", 22);
+                    pc.sftp.username          = sf.value("username", "");
+                    pc.sftp.password          = sf.value("password", "");
+                    pc.sftp.key_path          = sf.value("key_path", "");
+                    pc.sftp.known_hosts       = sf.value("known_hosts", "");
+                    pc.sftp.remote_root       = sf.value("remote_root", "/uploads");
+                    pc.sftp.prefix_template   = sf.value("prefix_template", pc.sftp.prefix_template);
+                    pc.sftp.connect_timeout_ms  = sf.value("connect_timeout_ms", 10000L);
+                    pc.sftp.transfer_timeout_ms = sf.value("transfer_timeout_ms", 0L);
+                    pc.sftp.max_retries         = sf.value("max_retries", 5);
                 }
 
-                g_cfg_by_system.emplace(shortName, std::move(pc));
+                cfg_by_system_.emplace(shortName, std::move(pc));
             }
 
-            if (g_cfg_by_system.empty()) {
+            if (cfg_by_system_.empty()) {
                 std::cerr << "[storage-uploader] no valid systems configured\n";
                 return -1;
             }
@@ -360,46 +353,60 @@ plugin_t* storage_uploader_plugin_new() {
             return -1;
         }
         return 0;
-    };
+    }
 
-    plugin->init = [](plugin_t* /*p*/)->int {
+    // init(): start the worker
+    int init(Config* /*config*/,
+             std::vector<Source*> /*sources*/,
+             std::vector<System*> /*systems*/) override {    // <<< CHANGED
         curl_global_init(CURL_GLOBAL_DEFAULT);
-        g_uploader = new StorageUploader(g_cfg_by_system);
-        g_uploader->start();
+        worker_ = std::make_unique<StorageUploaderWorker>(cfg_by_system_);
+        worker_->start();
         return 0;
-    };
+    }
 
-    plugin->start = [](plugin_t* /*p*/)->int { return 0; };
+    int start() override {                                    // <<< CHANGED
+        return 0;
+    }
 
-    plugin->stop = [](plugin_t* /*p*/)->int {
-        if (g_uploader) {
-            g_uploader->stop();
-            delete g_uploader;
-            g_uploader = nullptr;
+    int stop() override {                                     // <<< CHANGED
+        if (worker_) {
+            worker_->stop();
+            worker_.reset();
         }
         curl_global_cleanup();
         return 0;
-    };
+    }
 
-    // When a call ends, hand off all possible audio paths + JSON to the worker
-    plugin->call_end = [](plugin_t* /*p*/, Call_Data_t call_info)->int {
+    // call_end(): enqueue job with both potential audio paths + JSON
+    int call_end(Call_Data_t call_info) override {            // <<< CHANGED
         try {
             UploadJob job;
-            job.wav_path   = call_info.filename;         // WAV (original)
-            job.m4a_path   = call_info.converted;        // M4A (if present)
-            job.json_path  = call_info.status_filename;  // JSON metadata
-            job.shortName  = call_info.short_name;       // match config.systems[].shortName
+            job.wav_path   = call_info.filename;          // WAV (original)
+            job.m4a_path   = call_info.converted;         // M4A (if present)
+            job.json_path  = call_info.status_filename;   // NOTE: status_filename (correct)
+            job.shortName  = call_info.short_name;        // system shortName
             job.startTime  = static_cast<std::time_t>(call_info.start_time);
-            if (g_uploader) g_uploader->enqueue(job);
+            if (worker_) worker_->enqueue(job);
         } catch (...) {
-            // Never let exceptions bubble through TR
             return -1;
         }
         return 0;
-    };
+    }
 
-    // We don't implement other callbacks
-    return plugin;
-}
+    // Factory method for BOOST_DLL_ALIAS
+    static boost::shared_ptr<Storage_Uploader_Plugin> create() {  // <<< CHANGED
+        return boost::shared_ptr<Storage_Uploader_Plugin>(
+            new Storage_Uploader_Plugin());
+    }
 
-} // extern "C"
+private:
+    std::unordered_map<std::string, PluginConfig> cfg_by_system_;
+    std::unique_ptr<StorageUploaderWorker> worker_;
+};
+
+// Export symbol "create_plugin" so TR can load us (matches MQTT style).
+BOOST_DLL_ALIAS(                                           // <<< CHANGED
+    Storage_Uploader_Plugin::create,
+    create_plugin
+)
