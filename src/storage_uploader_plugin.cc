@@ -39,6 +39,8 @@
 // TR plugin API (class-based, like MQTT)
 #include <trunk-recorder/plugin_manager/plugin_api.h>   // <<< CHANGED
 
+#include <curl/curl.h>
+
 using json = nlohmann::json; // <<< CHANGED: convenience alias
 namespace fs = std::filesystem;
 
