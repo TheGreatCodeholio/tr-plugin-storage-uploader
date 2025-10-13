@@ -131,4 +131,3 @@ bool SftpClient::upload_file(const std::string& local_path,
     fclose(fh);
     return true;
 }
-
