@@ -144,6 +144,11 @@ private:
             SystemCtx* sys = it->second.get();
             const auto& cfg = sys->cfg;
 
+            if (!cfg.s3.enabled && !cfg.sftp.enabled) {
+                SU_LOG(warning) << "[" << job.shortName << "] both S3 and SFTP are disabled — nothing to upload";
+                continue;
+            }
+
             // Decide which audio files to upload based on cfg.audio
             // - "all": upload m4a then wav (if present)
             // - "m4a" : m4a else fall back to wav
@@ -181,7 +186,9 @@ private:
 
             // Prepare JSON keys/paths up-front
             std::string s3_json_key, sftp_json_rel;
-            if (cfg.upload_json && file_exists(job.json_path)) {
+            const bool has_json = cfg.upload_json && file_exists(job.json_path);
+
+            if (has_json) {
                 const std::string json_base = basename_of(job.json_path);
                 s3_json_key   = substitute_template(cfg.s3.prefix_template,
                                                     job.shortName, job.startTime, json_base);
@@ -208,9 +215,8 @@ private:
                 }
             };
 
-            bool ok = true;
+            bool all_ok = true; // tracks whether *both* destinations (if enabled) succeeded for all files
 
-            // Upload each chosen audio file
             for (const auto& audio_path : audio_files) {
                 const std::string base = basename_of(audio_path);
 
@@ -219,58 +225,73 @@ private:
                 const std::string sftp_rel =
                     substitute_template(cfg.sftp.prefix_template, job.shortName, job.startTime, base);
 
+                bool s3_ok   = true;
+                bool sftp_ok = true;
+
                 if (cfg.s3.enabled) {
-                    ok &= try_with_retries(
+                    s3_ok = try_with_retries(
                         [&](std::string* e){ return sys->s3->upload_file(audio_path, s3_key, {}, e); },
                         cfg.s3.max_retries,
                         "s3 audio: " + base);
+                    if (s3_ok && cfg.log_debug) {
+                        SU_LOG(info) << "[" << job.shortName << "] uploaded (S3): " << base;
+                    }
                 }
-                if (ok && cfg.log_debug) {
-                    SU_LOG(info) << "[" << job.shortName << "] uploaded (S3): " << base;
-                }
-                if (!ok) break;
 
                 if (cfg.sftp.enabled) {
-                    ok &= try_with_retries(
+                    sftp_ok = try_with_retries(
                         [&](std::string* e){ return sys->sftp->upload_file(audio_path, sftp_rel, e); },
                         cfg.sftp.max_retries,
                         "sftp audio: " + base);
+                    if (sftp_ok && cfg.log_debug) {
+                        SU_LOG(info) << "[" << job.shortName << "] uploaded (SFTP): " << base;
+                    }
                 }
-                if (ok && cfg.log_debug) {
-                    SU_LOG(info) << "[" << job.shortName << "] uploaded (SFTP): " << base;
-                }
-                if (!ok) break;
+
+                // This file is considered successful only if every enabled destination succeeded.
+                const bool file_ok =
+                    (!cfg.s3.enabled   || s3_ok) &&
+                    (!cfg.sftp.enabled || sftp_ok);
+
+                all_ok &= file_ok;
             }
 
             // Upload JSON once (if requested)
-            if (ok && cfg.upload_json && file_exists(job.json_path)) {
+            if (has_json) {
+                bool s3_json_ok   = true;
+                bool sftp_json_ok = true;
+
                 if (cfg.s3.enabled) {
-                    ok &= try_with_retries(
+                    s3_json_ok = try_with_retries(
                         [&](std::string* e){ return sys->s3->upload_file(job.json_path, s3_json_key, {}, e); },
                         cfg.s3.max_retries,
                         "s3 json");
                 }
-                if (ok && cfg.sftp.enabled) {
-                    ok &= try_with_retries(
+
+                if (cfg.sftp.enabled) {
+                    sftp_json_ok = try_with_retries(
                         [&](std::string* e){ return sys->sftp->upload_file(job.json_path, sftp_json_rel, e); },
                         cfg.sftp.max_retries,
                         "sftp json");
                 }
-                if (ok && cfg.upload_json && file_exists(job.json_path) && cfg.log_debug) {
+
+                if (((!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok)) && cfg.log_debug) {
                     SU_LOG(info) << "[" << job.shortName << "] uploaded metadata JSON: "
                                  << basename_of(job.json_path);
                 }
+
+                // fold into overall success
+                all_ok &= (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
             }
 
             // Optional cleanup
-            if (ok && cfg.delete_after_upload) {
+            if (all_ok && cfg.delete_after_upload) {
                 std::error_code ec;
                 for (const auto& p : audio_files) fs::remove(p, ec);
-                if (cfg.upload_json) fs::remove(job.json_path, ec);
-            }
-
-            if (ok && cfg.delete_after_upload && cfg.log_debug) {
-                SU_LOG(info) << "[" << job.shortName << "] deleted local files after upload";
+                if (has_json) fs::remove(job.json_path, ec);
+                if (cfg.log_debug) {
+                    SU_LOG(info) << "[" << job.shortName << "] deleted local files after upload";
+                }
             }
         }
     }
