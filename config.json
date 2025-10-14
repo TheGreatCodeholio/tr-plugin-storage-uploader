@@ -7,26 +7,45 @@
       "systems": [
         {
           "shortName": "chemung",
+          "audio": "auto",
           "uploadJson": true,
           "deleteAfterUpload": true,
+          "debug": true,
           "s3": {
             "enabled": true,
             "bucket": "chemung-calls",
             "region": "us-east-1",
-            "prefix_template": "chemung/{yyyy}/{MM}/{dd}/{basename}"
+            "prefix_template": "chemung/{yyyy}/{MM}/{dd}/{basename}",
+            "access_key": "AKIAxxxxxxxxxxxxxxx",
+            "secret_key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "connect_timeout_ms": 10000,
+            "transfer_timeout_ms": 0,
+            "max_retries": 5,
+            "acl": "bucket-owner-full-control",
+            "storage_class": "STANDARD_IA",
+            "sse": "AES256"
           }
         },
         {
           "shortName": "steuben",
+          "audio": "wav",
           "uploadJson": true,
           "deleteAfterUpload": false,
+          "debug": true,
           "sftp": {
             "enabled": true,
             "host": "sftp.steuben.net",
             "port": 22,
             "username": "upload",
+            "password": "************",
             "remote_root": "/srv/steuben/calls",
-            "prefix_template": "steuben/{yyyy}/{MM}/{dd}/{basename}"
+            "prefix_template": "steuben/{yyyy}/{MM}/{dd}/{basename}",
+            "accept_unknown_host": false,
+            "known_hosts": "/etc/ssh/ssh_known_hosts",
+            "connect_timeout_ms": 10000,
+            "transfer_timeout_ms": 0,
+            "max_retries": 5,
+            "web_base_url": "https://files.steuben.net/calls"
           }
         }
       ]
