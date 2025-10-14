@@ -1,4 +1,4 @@
-// s3_client.cc — verbose logging version
+// s3_client.cc
 #include "s3_client.hpp"
 
 #include <curl/curl.h>
@@ -8,7 +8,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <mutex>
-#include <cstdlib> // getenv
+#include <cstdlib>
 
 #include <boost/log/trivial.hpp>
 #define S3_TAG  "\t[Storage Uploader][S3]\t"
@@ -69,7 +69,7 @@ std::string S3Client::endpoint_for_bucket() const {
 
 std::string S3Client::url_for_key(const std::string& key) const {
     if (!cfg_.endpoint.empty()) {
-        // custom endpoint; assume path-style is acceptable: https://endpoint/bucket/key
+        // custom endpoint; https://endpoint/bucket/key
         std::string base = cfg_.endpoint;
         if (!base.empty() && base.back() == '/') base.pop_back();
         return base + "/" + cfg_.bucket + "/" + key;
@@ -176,7 +176,7 @@ bool S3Client::upload_file(const std::string& local_path,
     }
     for (const auto& h : extra_headers) headers = curl_slist_append(headers, h.c_str());
 
-    // Core options
+    // Core cURL options
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
     curl_easy_setopt(curl, CURLOPT_READDATA, fh);

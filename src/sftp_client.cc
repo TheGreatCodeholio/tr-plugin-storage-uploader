@@ -5,8 +5,8 @@
 #include <sstream>
 #include <boost/log/trivial.hpp>  // <<< ADD
 
-static constexpr const char* SFTP_TAG = "\t[Storage Uploader][SFTP]\t"; // <<< ADD
-#define SFTP_LOG(sev) BOOST_LOG_TRIVIAL(sev) << SFTP_TAG                // <<< ADD
+static constexpr const char* SFTP_TAG = "\t[Storage Uploader][SFTP]\t";
+#define SFTP_LOG(sev) BOOST_LOG_TRIVIAL(sev) << SFTP_TAG
 
 SftpClient::SftpClient(const SftpConfig& cfg) : cfg_(cfg) {}
 
@@ -21,11 +21,25 @@ std::string SftpClient::remote_url_for(const std::string& rel) const {
     return os.str();
 }
 
-// ---------- NEW helpers for known_hosts handling ----------
+std::string SftpClient::public_url_for(const std::string& rel) const {
+    if (!cfg_.public_base_url || cfg_.public_base_url->empty()) return {};
+    std::string base = *cfg_.public_base_url;
+
+    // trim trailing '/' on base
+    while (!base.empty() && base.back() == '/') base.pop_back();
+
+    // trim leading '/' on rel
+    std::string path = rel;
+    while (!path.empty() && path.front() == '/') path.erase(path.begin());
+
+    return base + "/" + path;
+}
+
+// ---------- helpers for known_hosts handling ----------
 
 // Ensure we have a writable known_hosts path. If user didn't provide one,
 // use a plugin-local default under /tmp and create it if needed.
-static std::string ensure_known_hosts_path(const std::string& user_path) { // <<< ADD
+static std::string ensure_known_hosts_path(const std::string& user_path) {
     namespace fs = std::filesystem;
     std::string path = user_path.empty()
         ? std::string("/tmp/tr_storage_uploader_known_hosts")  // default
@@ -45,13 +59,13 @@ static std::string ensure_known_hosts_path(const std::string& user_path) { // <<
 
 // libcurl SSH key callback: decide how to handle host key verification
 // We only auto-accept when the host is *missing* from known_hosts.
-// A *mismatch* is rejected to avoid MITM.                              // <<< ADD
-struct HostKeyCtx { bool accept_unknown; std::string kh_path; };       // <<< ADD
+// A *mismatch* is rejected to avoid MITM.
+struct HostKeyCtx { bool accept_unknown; std::string kh_path; };
 
-static int ssh_key_cb(                                                  // <<< ADD
-    CURL* /*easy*/,
-    const struct curl_khkey* /*knownkey*/,
-    const struct curl_khkey* /*foundkey*/,
+static int ssh_key_cb(
+    CURL* ,
+    const struct curl_khkey*,
+    const struct curl_khkey*,
     enum curl_khmatch match,
     void* clientp)
 {
@@ -79,7 +93,7 @@ static int ssh_key_cb(                                                  // <<< A
             return CURLKHSTAT_REJECT;
     }
 }
-// ---------- end new helpers ----------
+// ---------- end known_hosts helpers ----------
 
 bool SftpClient::upload_file(const std::string& local_path,
                              const std::string& remote_rel_path,
@@ -103,12 +117,12 @@ bool SftpClient::upload_file(const std::string& local_path,
     if (cfg_.transfer_timeout_ms > 0) curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, cfg_.transfer_timeout_ms);
 
     // ---------- SSH known_hosts + auto-accept handling ----------
-    // Always provide a known_hosts path (user or default).                 // <<< CHANGED
+    // Always provide a known_hosts path (user or default).
     const std::string kh_path = ensure_known_hosts_path(cfg_.known_hosts);
     curl_easy_setopt(curl, CURLOPT_SSH_KNOWNHOSTS, kh_path.c_str());
 
     // If user asked to accept unknown hosts, install the KEYFUNCTION.
-    if (cfg_.accept_unknown_host) {                                       // <<< CHANGED
+    if (cfg_.accept_unknown_host) {
         HostKeyCtx hkctx{true, kh_path};
         curl_easy_setopt(curl, CURLOPT_SSH_KEYFUNCTION, ssh_key_cb);
         curl_easy_setopt(curl, CURLOPT_SSH_KEYDATA, &hkctx);

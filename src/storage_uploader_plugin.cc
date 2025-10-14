@@ -26,7 +26,8 @@
 #include <memory>
 #include <vector>
 #include <iostream>
-#include <algorithm> // tolower
+#include <algorithm>
+#include <fstream>
 #include <boost/log/trivial.hpp>
 
 #include <boost/dll/alias.hpp>
@@ -37,12 +38,12 @@
 #include "s3_client.hpp"
 #include "sftp_client.hpp"
 
-// TR plugin API (class-based, like MQTT)
-#include <trunk-recorder/plugin_manager/plugin_api.h>   // <<< CHANGED
+// TR plugin API
+#include <trunk-recorder/plugin_manager/plugin_api.h>
 
 #include <curl/curl.h>
 
-using json = nlohmann::json; // <<< CHANGED: convenience alias
+using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 static constexpr const char* SU_TAG = "\t[Storage Uploader]\t";
@@ -50,12 +51,12 @@ static constexpr const char* SU_TAG = "\t[Storage Uploader]\t";
 
 // ---------------- Small helpers ----------------
 
-static inline bool file_exists(const std::string& p) {
+static bool file_exists(const std::string& p) {
     std::error_code ec;
     return !p.empty() && fs::exists(p, ec);
 }
 
-static inline std::string to_lower_copy(std::string s) {
+static std::string to_lower_copy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
     return s;
@@ -90,6 +91,35 @@ struct SystemCtx {
           s3(std::make_unique<S3Client>(cfg.s3)),
           sftp(std::make_unique<SftpClient>(cfg.sftp)) {}
 };
+
+// ---------------- Remote links helper ---------------------
+static void add_remote_links_to_json(
+    const std::string& json_path,
+    const std::vector<nlohmann::json>& s3_links,
+    const std::vector<nlohmann::json>& sftp_links)
+{
+    if (json_path.empty()) return;
+    std::error_code fec;
+    if (!std::filesystem::exists(json_path, fec)) return;
+
+    try {
+        std::ifstream in(json_path);
+        nlohmann::json j = nlohmann::json::parse(in, /*cb*/nullptr, /*allow_exceptions*/true, /*ignore_comments*/true);
+        in.close();
+
+        // namespaced block to avoid collisions with TR fields
+        nlohmann::json& storage = j["storage_uploader"];
+        if (!storage.is_object()) storage = nlohmann::json::object();
+
+        if (!s3_links.empty())   storage["s3"]   = s3_links;
+        if (!sftp_links.empty()) storage["sftp"] = sftp_links;
+
+        std::ofstream out(json_path, std::ios::trunc);
+        out << j.dump(2);
+    } catch (const std::exception& e) {
+        SU_LOG(warning) << "[JSON] failed to add remote links: " << e.what();
+    }
+}
 
 // ---------------- Worker with async queue ----------------
 
@@ -217,6 +247,12 @@ private:
 
             bool all_ok = true; // tracks whether *both* destinations (if enabled) succeeded for all files
 
+            std::vector<nlohmann::json> s3_links;
+            std::vector<nlohmann::json> sftp_links;
+            nlohmann::json json_links_s3 = nlohmann::json::object();
+            nlohmann::json json_links_sftp = nlohmann::json::object();
+
+
             for (const auto& audio_path : audio_files) {
                 const std::string base = basename_of(audio_path);
 
@@ -228,13 +264,24 @@ private:
                 bool s3_ok   = true;
                 bool sftp_ok = true;
 
+
+
                 if (cfg.s3.enabled) {
                     s3_ok = try_with_retries(
                         [&](std::string* e){ return sys->s3->upload_file(audio_path, s3_key, {}, e); },
                         cfg.s3.max_retries,
                         "s3 audio: " + base);
-                    if (s3_ok && cfg.log_debug) {
-                        SU_LOG(info) << "[" << job.shortName << "] uploaded (S3): " << base;
+                    if (s3_ok) {
+                        // compute a URL/key record even if not publicly accessible
+                        nlohmann::json rec = {
+                            {"bucket", cfg.s3.bucket},
+                            {"key",    s3_key},
+                            {"region", cfg.s3.region}
+                        };
+                        // Optional: include the HTTP URL you PUT to (may not be public)
+                        try { rec["url"] = sys->s3->url_for_key(s3_key); } catch(...) {}
+                        s3_links.push_back(std::move(rec));
+                        if (cfg.log_debug) SU_LOG(info) << "[" << job.shortName << "] uploaded (S3): " << base;
                     }
                 }
 
@@ -243,8 +290,13 @@ private:
                         [&](std::string* e){ return sys->sftp->upload_file(audio_path, sftp_rel, e); },
                         cfg.sftp.max_retries,
                         "sftp audio: " + base);
-                    if (sftp_ok && cfg.log_debug) {
-                        SU_LOG(info) << "[" << job.shortName << "] uploaded (SFTP): " << base;
+                    if (sftp_ok) {
+                        nlohmann::json rec = {
+                            {"host", cfg.sftp.host},
+                            {"path", sftp_rel}
+                        };
+                        sftp_links.push_back(std::move(rec));
+                        if (cfg.log_debug) SU_LOG(info) << "[" << job.shortName << "] uploaded (SFTP): " << base;
                     }
                 }
 
@@ -256,23 +308,82 @@ private:
                 all_ok &= file_ok;
             }
 
-            // Upload JSON once (if requested)
+            // Upload JSON once
             if (has_json) {
+                const std::string json_base = basename_of(job.json_path);
+                const std::string s3_json_key_planned =
+                    substitute_template(cfg.s3.prefix_template, job.shortName, job.startTime, json_base);
+                const std::string sftp_json_rel_planned =
+                    substitute_template(cfg.sftp.prefix_template, job.shortName, job.startTime, json_base);
+
+                // Stamp links (audio + where the JSON itself will be)
+                nlohmann::json s3_json_rec, sftp_json_rec;
+                if (cfg.s3.enabled) {
+                    s3_json_rec = {
+                        {"bucket", cfg.s3.bucket},
+                        {"key",    s3_json_key_planned},
+                        {"region", cfg.s3.region},
+                        {"url",    sys->s3->url_for_key(s3_json_key_planned)}
+                    };
+                }
+                if (cfg.sftp.enabled) {
+                    sftp_json_rec = {
+                        {"host", cfg.sftp.host},
+                        {"path", sftp_json_rel_planned}
+                    };
+                }
+
+                // Merge into JSON on disk BEFORE uploading it, and set status="uploaded"
+                auto enrich_json = [&](const std::string& path){
+                    if (!file_exists(path)) {
+                        SU_LOG(warning) << "[JSON] status file vanished before enrich: " << path;
+                        return;
+                    }
+                    try {
+                        std::ifstream in(path);
+                        nlohmann::json j = nlohmann::json::parse(in);
+                        in.close();
+
+                        nlohmann::json& storage = j["storage_uploader"];
+                        if (!storage.is_object()) storage = nlohmann::json::object();
+
+                        if (!s3_links.empty())   storage["s3"]   = s3_links;
+                        if (!sftp_links.empty()) storage["sftp"] = sftp_links;
+
+                        // add json locations:
+                        if (!s3_json_rec.is_null())   storage["json_s3"]   = s3_json_rec;
+                        if (!sftp_json_rec.is_null()) storage["json_sftp"] = sftp_json_rec;
+
+                        storage["status"] = "uploaded";
+
+                        std::ofstream out(path, std::ios::trunc);
+                        out << j.dump(2);
+                    } catch (const std::exception& e) {
+                        SU_LOG(warning) << "[JSON] failed to enrich: " << e.what();
+                    }
+                };
+
+                enrich_json(job.json_path);
+
+                // Now actually upload the JSON
                 bool s3_json_ok   = true;
                 bool sftp_json_ok = true;
 
                 if (cfg.s3.enabled) {
+                    SU_LOG(info) << "[" << job.shortName << "] S3 PUT json:"
+                                 << " key=\"" << s3_json_key_planned << "\""
+                                 << " url=" << sys->s3->url_for_key(s3_json_key_planned);
                     s3_json_ok = try_with_retries(
-                        [&](std::string* e){ return sys->s3->upload_file(job.json_path, s3_json_key, {}, e); },
-                        cfg.s3.max_retries,
-                        "s3 json");
+                        [&](std::string* e){ return sys->s3->upload_file(job.json_path, s3_json_key_planned, {}, e); },
+                        cfg.s3.max_retries, "s3 json");
                 }
 
                 if (cfg.sftp.enabled) {
+                    SU_LOG(info) << "[" << job.shortName << "] SFTP PUT json:"
+                                 << " path=\"" << sftp_json_rel_planned << "\" host=" << cfg.sftp.host;
                     sftp_json_ok = try_with_retries(
-                        [&](std::string* e){ return sys->sftp->upload_file(job.json_path, sftp_json_rel, e); },
-                        cfg.sftp.max_retries,
-                        "sftp json");
+                        [&](std::string* e){ return sys->sftp->upload_file(job.json_path, sftp_json_rel_planned, e); },
+                        cfg.sftp.max_retries, "sftp json");
                 }
 
                 if (((!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok)) && cfg.log_debug) {
@@ -280,9 +391,10 @@ private:
                                  << basename_of(job.json_path);
                 }
 
-                // fold into overall success
                 all_ok &= (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
             }
+
+
 
             // Optional cleanup
             if (all_ok && cfg.delete_after_upload) {
@@ -308,7 +420,7 @@ private:
 };
 
 // =======================
-//  Plugin class (NEW)   // <<< CHANGED: class-based API like MQTT
+//  Plugin class
 // =======================
 
 class Storage_Uploader_Plugin : public Plugin_Api {
@@ -316,8 +428,7 @@ public:
     Storage_Uploader_Plugin() = default;
 
     // parse_config(json)
-    // RDIO-style: we expect a "systems" array inside this plugin block.
-    int parse_config(json config_data) override {            // <<< CHANGED
+    int parse_config(json config_data) override {
         try {
             SU_LOG(info) << "Parsing plugin config...";
             cfg_by_system_.clear();
@@ -383,6 +494,11 @@ public:
                         sf.value("accept_unknown_host",
                         sf.value("auto_accept_unknown_host",
                         sf.value("insecure_accept_unknown_host", false)));
+
+                    if (sf.contains("public_base_url")) {
+                        const std::string p = sf.value("public_base_url", "");
+                        if (!p.empty()) pc.sftp.public_base_url = p;            // NEW
+                    }
                 }
 
                 const bool s3_on   = pc.s3.enabled;
@@ -428,9 +544,9 @@ public:
     }
 
     // init(): start the worker
-    int init(Config* /*config*/,
-             std::vector<Source*> /*sources*/,
-             std::vector<System*> /*systems*/) override {    // <<< CHANGED
+    int init(Config*,
+             std::vector<Source*>,
+             std::vector<System*>) override {
         SU_LOG(info) << "Initializing (curl + worker)...";
         curl_global_init(CURL_GLOBAL_DEFAULT);
         worker_ = std::make_unique<StorageUploaderWorker>(cfg_by_system_);
@@ -438,12 +554,12 @@ public:
         return 0;
     }
 
-    int start() override {                                    // <<< CHANGED
+    int start() override {
         SU_LOG(info) << "Worker started.";
         return 0;
     }
 
-    int stop() override {                                     // <<< CHANGED
+    int stop() override {
         SU_LOG(info) << "Stopping worker...";
         if (worker_) {
             worker_->stop();
@@ -455,28 +571,126 @@ public:
     }
 
     // call_end(): enqueue job with both potential audio paths + JSON
-    int call_end(Call_Data_t call_info) override {            // <<< CHANGED
+    int call_end(Call_Data_t call_info) override {
         try {
             UploadJob job;
-            job.wav_path   = call_info.filename;          // WAV (original)
-            job.m4a_path   = call_info.converted;         // M4A (if present)
-            job.json_path  = call_info.status_filename;   // NOTE: status_filename (correct)
-            job.shortName  = call_info.short_name;        // system shortName
+            job.wav_path   = call_info.filename;        // WAV (original)
+            job.m4a_path   = call_info.converted;       // M4A (if present)
+            job.json_path  = call_info.status_filename; // JSON already written by Call_Concluder
+            job.shortName  = call_info.short_name;
             job.startTime  = static_cast<std::time_t>(call_info.start_time);
-            SU_LOG(info) << "[" << job.shortName << "] queue upload: "
-             << "wav=" << basename_of(job.wav_path)
-             << " m4a=" << basename_of(job.m4a_path)
-             << " json=" << basename_of(job.json_path);
 
+            // --- 1) find per-system cfg
+            auto it = cfg_by_system_.find(job.shortName);
+            if (it == cfg_by_system_.end()) {
+                SU_LOG(warning) << "[" << job.shortName << "] no per-system config — enqueueing without JSON stamp";
+                if (worker_) worker_->enqueue(job);
+                return 0;
+            }
+            const PluginConfig& cfg = it->second;
+
+            // --- 2) choose audio files (same rules as worker)
+            std::vector<std::string> audio_files;
+            const bool has_wav = file_exists(job.wav_path);
+            const bool has_m4a = file_exists(job.m4a_path);
+            const std::string mode = to_lower_copy(cfg.audio);
+
+            if (mode == "all") {
+                if (has_m4a) audio_files.push_back(job.m4a_path);
+                if (has_wav) audio_files.push_back(job.wav_path);
+            } else if (mode == "m4a") {
+                if      (has_m4a) audio_files.push_back(job.m4a_path);
+                else if (has_wav) audio_files.push_back(job.wav_path);
+            } else if (mode == "wav") {
+                if      (has_wav) audio_files.push_back(job.wav_path);
+                else if (has_m4a) audio_files.push_back(job.m4a_path);
+            } else { // auto
+                if      (has_m4a) audio_files.push_back(job.m4a_path);
+                else if (has_wav) audio_files.push_back(job.wav_path);
+            }
+
+            // --- 3) compute planned keys/paths (and urls)
+            std::vector<nlohmann::json> files;
+            std::optional<S3Client> s3c;
+            if (cfg.s3.enabled) s3c.emplace(cfg.s3);
+
+            for (const auto& p : audio_files) {
+                const std::string base = basename_of(p);
+
+                std::string s3_url, web_url;
+
+                if (cfg.s3.enabled) {
+                    const std::string key = substitute_template(cfg.s3.prefix_template, job.shortName, job.startTime, base);
+                    s3_url = s3c->url_for_key(key);
+                }
+
+                if (cfg.sftp.enabled) {
+                    const std::string rel = substitute_template(cfg.sftp.prefix_template, job.shortName, job.startTime, base);
+                    web_url = sys->sftp->public_url_for(rel);   // <<— NEW
+                }
+
+                nlohmann::json f = { {"basename", base} };
+                if (!s3_url.empty())  f["s3_url"]  = s3_url;
+                if (!web_url.empty()) f["web_url"] = web_url;
+                files.push_back(std::move(f));
+            }
+
+            // planned location of the JSON itself
+            std::string json_s3_url, json_web_url;
+            if (cfg.upload_json && file_exists(job.json_path)) {
+                const std::string jbase = basename_of(job.json_path);
+                if (cfg.s3.enabled) {
+                    const std::string jkey = substitute_template(cfg.s3.prefix_template, job.shortName, job.startTime, jbase);
+                    json_s3_url = s3c ? s3c->url_for_key(jkey) : "";
+                }
+                if (cfg.sftp.enabled) {
+                    const std::string jrel = substitute_template(cfg.sftp.prefix_template, job.shortName, job.startTime, jbase);
+                    json_web_url = sys->sftp->public_url_for(jrel);
+                }
+            }
+
+            // --- 4) stamp JSON on disk (new keys)
+            if (cfg.upload_json && file_exists(job.json_path)) {
+                try {
+                    std::ifstream in(job.json_path);
+                    nlohmann::json j = nlohmann::json::parse(in);
+                    in.close();
+
+                    nlohmann::json& su = j["storage_uploader"];
+                    if (!su.is_object()) su = nlohmann::json::object();
+
+                    su["status"] = "planned";
+                    if (!files.empty())     su["files"]       = files;
+                    if (!json_s3_url.empty())  su["json_s3_url"]  = json_s3_url;
+                    if (!json_web_url.empty()) su["json_web_url"] = json_web_url;
+
+                    std::ofstream out(job.json_path, std::ios::trunc);
+                    out << j.dump(2);
+
+                    if (cfg.log_debug) {SU_LOG(info) << "[" << job.shortName << "] stamped storage URLs (s3_url/web_url) into JSON";
+                    }
+                } catch (const std::exception& e) {
+                    SU_LOG(warning) << "[" << job.shortName << "] failed stamping JSON: " << e.what();
+                }
+            }
+
+
+            // --- 5) enqueue async upload
+            SU_LOG(info) << "[" << job.shortName << "] queue upload: "
+                         << "wav=" << basename_of(job.wav_path)
+                         << " m4a=" << basename_of(job.m4a_path)
+                         << " json=" << basename_of(job.json_path);
             if (worker_) worker_->enqueue(job);
+
         } catch (...) {
             return -1;
         }
+
         return 0;
     }
 
     // Factory method for BOOST_DLL_ALIAS
-    static boost::shared_ptr<Storage_Uploader_Plugin> create() {  // <<< CHANGED
+    static boost::shared_ptr<Storage_Uploader_Plugin> create() {
         return boost::shared_ptr<Storage_Uploader_Plugin>(
             new Storage_Uploader_Plugin());
     }
@@ -487,7 +701,7 @@ private:
 };
 
 // Export symbol "create_plugin" so TR can load us (matches MQTT style).
-BOOST_DLL_ALIAS(                                           // <<< CHANGED
+BOOST_DLL_ALIAS(
     Storage_Uploader_Plugin::create,
     create_plugin
 )
