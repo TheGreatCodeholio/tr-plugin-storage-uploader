@@ -8,6 +8,11 @@
 static constexpr const char* SFTP_TAG = "\t[Storage Uploader][SFTP]\t";
 #define SFTP_LOG(sev) BOOST_LOG_TRIVIAL(sev) << SFTP_TAG
 
+static std::string trim_leading_slashes(std::string s) {
+    while (!s.empty() && (s.front() == '/' || s.front() == '\\')) s.erase(s.begin());
+    return s;
+}
+
 SftpClient::SftpClient(const SftpConfig& cfg) : cfg_(cfg) {}
 
 std::string SftpClient::remote_url_for(const std::string& rel) const {
@@ -19,20 +24,6 @@ std::string SftpClient::remote_url_for(const std::string& rel) const {
     std::ostringstream os;
     os << "sftp://" << cfg_.host << ":" << cfg_.port << root << "/" << r;
     return os.str();
-}
-
-std::string SftpClient::public_url_for(const std::string& rel) const {
-    if (!cfg_.public_base_url || cfg_.public_base_url->empty()) return {};
-    std::string base = *cfg_.public_base_url;
-
-    // trim trailing '/' on base
-    while (!base.empty() && base.back() == '/') base.pop_back();
-
-    // trim leading '/' on rel
-    std::string path = rel;
-    while (!path.empty() && path.front() == '/') path.erase(path.begin());
-
-    return base + "/" + path;
 }
 
 // ---------- helpers for known_hosts handling ----------
@@ -160,4 +151,11 @@ bool SftpClient::upload_file(const std::string& local_path,
     curl_easy_cleanup(curl);
     fclose(fh);
     return true;
+}
+
+std::string SftpClient::public_url_for(const std::string& rel) const {
+    if (!cfg_.public_base_url || cfg_.public_base_url->empty()) return {};
+    std::string base = *cfg_.public_base_url;
+    if (!base.empty() && base.back() == '/') base.pop_back();
+    return base + "/" + trim_leading_slashes(rel);
 }

@@ -252,6 +252,16 @@ private:
             nlohmann::json json_links_s3 = nlohmann::json::object();
             nlohmann::json json_links_sftp = nlohmann::json::object();
 
+            auto sftp_web_url = [&](const std::string& rel) -> std::string {
+                if (cfg.sftp.public_base_url && !cfg.sftp.public_base_url->empty()) {
+                    std::string base = *cfg.sftp.public_base_url;
+                    if (!base.empty() && base.back() == '/') base.pop_back();
+                    std::string path = rel;
+                    while (!path.empty() && (path.front() == '/' || path.front() == '\\')) path.erase(path.begin());
+                    return base + "/" + path;
+                }
+                return {};
+            };
 
             for (const auto& audio_path : audio_files) {
                 const std::string base = basename_of(audio_path);
@@ -264,22 +274,19 @@ private:
                 bool s3_ok   = true;
                 bool sftp_ok = true;
 
-
-
                 if (cfg.s3.enabled) {
                     s3_ok = try_with_retries(
                         [&](std::string* e){ return sys->s3->upload_file(audio_path, s3_key, {}, e); },
                         cfg.s3.max_retries,
                         "s3 audio: " + base);
+
                     if (s3_ok) {
-                        // compute a URL/key record even if not publicly accessible
                         nlohmann::json rec = {
                             {"bucket", cfg.s3.bucket},
                             {"key",    s3_key},
-                            {"region", cfg.s3.region}
+                            {"region", cfg.s3.region},
+                            {"s3_url", sys->s3->url_for_key(s3_key)}   // ← NEW
                         };
-                        // Optional: include the HTTP URL you PUT to (may not be public)
-                        try { rec["url"] = sys->s3->url_for_key(s3_key); } catch(...) {}
                         s3_links.push_back(std::move(rec));
                         if (cfg.log_debug) SU_LOG(info) << "[" << job.shortName << "] uploaded (S3): " << base;
                     }
@@ -290,11 +297,16 @@ private:
                         [&](std::string* e){ return sys->sftp->upload_file(audio_path, sftp_rel, e); },
                         cfg.sftp.max_retries,
                         "sftp audio: " + base);
+
                     if (sftp_ok) {
                         nlohmann::json rec = {
                             {"host", cfg.sftp.host},
                             {"path", sftp_rel}
                         };
+                        // optional public URL if configured
+                        if (auto wu = sftp_web_url(sftp_rel); !wu.empty()) {
+                            rec["web_url"] = wu;          // ← NEW
+                        }
                         sftp_links.push_back(std::move(rec));
                         if (cfg.log_debug) SU_LOG(info) << "[" << job.shortName << "] uploaded (SFTP): " << base;
                     }
@@ -316,79 +328,79 @@ private:
                 const std::string sftp_json_rel_planned =
                     substitute_template(cfg.sftp.prefix_template, job.shortName, job.startTime, json_base);
 
-                // Stamp links (audio + where the JSON itself will be)
-                nlohmann::json s3_json_rec, sftp_json_rec;
-                if (cfg.s3.enabled) {
-                    s3_json_rec = {
-                        {"bucket", cfg.s3.bucket},
-                        {"key",    s3_json_key_planned},
-                        {"region", cfg.s3.region},
-                        {"url",    sys->s3->url_for_key(s3_json_key_planned)}
-                    };
-                }
-                if (cfg.sftp.enabled) {
-                    sftp_json_rec = {
-                        {"host", cfg.sftp.host},
-                        {"path", sftp_json_rel_planned}
-                    };
-                }
+                // Build the public URLs for the JSON itself (to stamp later)
+                std::string json_s3_url, json_web_url;
+                if (cfg.s3.enabled)   json_s3_url  = sys->s3->url_for_key(s3_json_key_planned);
+                if (cfg.sftp.enabled) json_web_url = sftp_web_url(sftp_json_rel_planned);
 
-                // Merge into JSON on disk BEFORE uploading it, and set status="uploaded"
-                auto enrich_json = [&](const std::string& path){
-                    if (!file_exists(path)) {
-                        SU_LOG(warning) << "[JSON] status file vanished before enrich: " << path;
-                        return;
-                    }
-                    try {
-                        std::ifstream in(path);
-                        nlohmann::json j = nlohmann::json::parse(in);
-                        in.close();
-
-                        nlohmann::json& storage = j["storage_uploader"];
-                        if (!storage.is_object()) storage = nlohmann::json::object();
-
-                        if (!s3_links.empty())   storage["s3"]   = s3_links;
-                        if (!sftp_links.empty()) storage["sftp"] = sftp_links;
-
-                        // add json locations:
-                        if (!s3_json_rec.is_null())   storage["json_s3"]   = s3_json_rec;
-                        if (!sftp_json_rec.is_null()) storage["json_sftp"] = sftp_json_rec;
-
-                        storage["status"] = "uploaded";
-
-                        std::ofstream out(path, std::ios::trunc);
-                        out << j.dump(2);
-                    } catch (const std::exception& e) {
-                        SU_LOG(warning) << "[JSON] failed to enrich: " << e.what();
-                    }
-                };
-
-                enrich_json(job.json_path);
-
-                // Now actually upload the JSON
                 bool s3_json_ok   = true;
                 bool sftp_json_ok = true;
 
+                // Actually upload the JSON now
                 if (cfg.s3.enabled) {
-                    SU_LOG(info) << "[" << job.shortName << "] S3 PUT json:"
-                                 << " key=\"" << s3_json_key_planned << "\""
-                                 << " url=" << sys->s3->url_for_key(s3_json_key_planned);
+                    SU_LOG(info) << "[" << job.shortName << "] S3 PUT json: key=\"" << s3_json_key_planned
+                                 << "\" url=" << json_s3_url;
                     s3_json_ok = try_with_retries(
                         [&](std::string* e){ return sys->s3->upload_file(job.json_path, s3_json_key_planned, {}, e); },
                         cfg.s3.max_retries, "s3 json");
                 }
 
                 if (cfg.sftp.enabled) {
-                    SU_LOG(info) << "[" << job.shortName << "] SFTP PUT json:"
-                                 << " path=\"" << sftp_json_rel_planned << "\" host=" << cfg.sftp.host;
+                    SU_LOG(info) << "[" << job.shortName << "] SFTP PUT json: path=\"" << sftp_json_rel_planned
+                                 << "\" host=" << cfg.sftp.host;
                     sftp_json_ok = try_with_retries(
                         [&](std::string* e){ return sys->sftp->upload_file(job.json_path, sftp_json_rel_planned, e); },
                         cfg.sftp.max_retries, "sftp json");
                 }
 
-                if (((!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok)) && cfg.log_debug) {
-                    SU_LOG(info) << "[" << job.shortName << "] uploaded metadata JSON: "
-                                 << basename_of(job.json_path);
+                // Final JSON stamp AFTER uploads
+                try {
+                    if (file_exists(job.json_path)) {
+                        std::ifstream in(job.json_path);
+                        nlohmann::json j = nlohmann::json::parse(in);
+                        in.close();
+
+                        nlohmann::json& storage = j["storage_uploader"];
+                        if (!storage.is_object()) storage = nlohmann::json::object();
+
+                        // Make a "files" array with s3_url / web_url for convenience
+                        std::vector<nlohmann::json> files_urls;
+                        for (const auto& ap : audio_files) {
+                            const std::string basef = basename_of(ap);
+                            nlohmann::json f = { {"basename", basef} };
+
+                            if (cfg.s3.enabled) {
+                                const std::string k = substitute_template(cfg.s3.prefix_template, job.shortName, job.startTime, basef);
+                                f["s3_url"] = sys->s3->url_for_key(k);
+                            }
+                            if (cfg.sftp.enabled) {
+                                const std::string r = substitute_template(cfg.sftp.prefix_template, job.shortName, job.startTime, basef);
+                                if (auto wu = sftp_web_url(r); !wu.empty()) f["web_url"] = wu;
+                            }
+                            files_urls.push_back(std::move(f));
+                        }
+
+                        // Write new-style keys
+                        if (!files_urls.empty()) storage["files"] = files_urls;
+                        if (!json_s3_url.empty())  storage["json_s3_url"]  = json_s3_url;
+                        if (!json_web_url.empty()) storage["json_web_url"] = json_web_url;
+
+                        // status reflects audio + JSON destinations
+                        const bool json_ok = (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
+                        const bool upload_ok = all_ok && json_ok;
+                        storage["status"] = upload_ok ? "uploaded" : "partial";
+
+                        std::ofstream out(job.json_path, std::ios::trunc);
+                        out << j.dump(2);
+                    } else {
+                        SU_LOG(warning) << "[JSON] status file vanished before final stamp: " << job.json_path;
+                    }
+                } catch (const std::exception& e) {
+                    SU_LOG(warning) << "[JSON] failed to finalize: " << e.what();
+                }
+
+                if (json_links_s3.is_object() || json_links_sftp.is_object()) {
+                    // (Optional) keep legacy blocks if you still want them elsewhere
                 }
 
                 all_ok &= (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
@@ -497,7 +509,7 @@ public:
 
                     if (sf.contains("public_base_url")) {
                         const std::string p = sf.value("public_base_url", "");
-                        if (!p.empty()) pc.sftp.public_base_url = p;            // NEW
+                        if (!p.empty()) pc.sftp.public_base_url = p;
                     }
                 }
 
@@ -614,24 +626,31 @@ public:
             std::optional<S3Client> s3c;
             if (cfg.s3.enabled) s3c.emplace(cfg.s3);
 
+            // helper to build web URL from SFTP config
+            auto make_web_url = [&](const std::string& rel) -> std::string {
+                if (cfg.sftp.public_base_url && !cfg.sftp.public_base_url->empty()) {
+                    std::string base = *cfg.sftp.public_base_url;
+                    if (!base.empty() && base.back() == '/') base.pop_back();
+                    std::string path = rel;
+                    while (!path.empty() && (path.front() == '/' || path.front() == '\\')) path.erase(path.begin());
+                    return base + "/" + path;
+                }
+                return {};
+            };
+
             for (const auto& p : audio_files) {
                 const std::string base = basename_of(p);
-
-                std::string s3_url, web_url;
+                nlohmann::json f = { {"basename", base} };
 
                 if (cfg.s3.enabled) {
                     const std::string key = substitute_template(cfg.s3.prefix_template, job.shortName, job.startTime, base);
-                    s3_url = s3c->url_for_key(key);
+                    if (s3c) f["s3_url"] = s3c->url_for_key(key);
                 }
-
                 if (cfg.sftp.enabled) {
                     const std::string rel = substitute_template(cfg.sftp.prefix_template, job.shortName, job.startTime, base);
-                    web_url = sys->sftp->public_url_for(rel);   // <<— NEW
+                    const std::string wu  = make_web_url(rel);
+                    if (!wu.empty()) f["web_url"] = wu;
                 }
-
-                nlohmann::json f = { {"basename", base} };
-                if (!s3_url.empty())  f["s3_url"]  = s3_url;
-                if (!web_url.empty()) f["web_url"] = web_url;
                 files.push_back(std::move(f));
             }
 
@@ -645,11 +664,11 @@ public:
                 }
                 if (cfg.sftp.enabled) {
                     const std::string jrel = substitute_template(cfg.sftp.prefix_template, job.shortName, job.startTime, jbase);
-                    json_web_url = sys->sftp->public_url_for(jrel);
+                    json_web_url = make_web_url(jrel);
                 }
             }
 
-            // --- 4) stamp JSON on disk (new keys)
+            // --- 4) stamp JSON on disk (status="planned")
             if (cfg.upload_json && file_exists(job.json_path)) {
                 try {
                     std::ifstream in(job.json_path);
@@ -660,14 +679,15 @@ public:
                     if (!su.is_object()) su = nlohmann::json::object();
 
                     su["status"] = "planned";
-                    if (!files.empty())     su["files"]       = files;
-                    if (!json_s3_url.empty())  su["json_s3_url"]  = json_s3_url;
-                    if (!json_web_url.empty()) su["json_web_url"] = json_web_url;
+                    if (!files.empty())         su["files"]        = files;
+                    if (!json_s3_url.empty())   su["json_s3_url"]  = json_s3_url;
+                    if (!json_web_url.empty())  su["json_web_url"] = json_web_url;
 
                     std::ofstream out(job.json_path, std::ios::trunc);
                     out << j.dump(2);
 
-                    if (cfg.log_debug) {SU_LOG(info) << "[" << job.shortName << "] stamped storage URLs (s3_url/web_url) into JSON";
+                    if (cfg.log_debug) {
+                        SU_LOG(info) << "[" << job.shortName << "] stamped storage URLs (s3_url/web_url) into JSON";
                     }
                 } catch (const std::exception& e) {
                     SU_LOG(warning) << "[" << job.shortName << "] failed stamping JSON: " << e.what();
