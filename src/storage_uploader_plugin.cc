@@ -63,22 +63,62 @@ static std::string to_lower_copy(std::string s) {
     return s;
 }
 
-static bool has_transcript_block(const std::string& path) {
-    try {
-        if (!file_exists(path)) return false;
-        std::ifstream in(path);
-        nlohmann::json j = nlohmann::json::parse(in);
-        in.close();
-        if (!j.contains("transcriber") || !j["transcriber"].is_object()) return false;
-        const auto& t = j["transcriber"];
-        if (t.contains("status") && t["status"].is_string()) {
-            std::string s = t["status"].get<std::string>();
-            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-            if (s == "done") return true;
+static bool load_json_with_retries(const std::string& path,
+                                   nlohmann::json* out,
+                                   int tries = 10,
+                                   int delay_ms = 50) {
+    for (int i = 0; i < tries; ++i) {
+        try {
+            std::ifstream in(path);
+            if (!in.good()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                continue;
+            }
+            *out = nlohmann::json::parse(in, /*cb*/nullptr, /*allow_exceptions*/true, /*ignore_comments*/true);
+            return true;
+        } catch (...) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         }
-        return t.contains("transcript") && t["transcript"].is_string()
-            && !t["transcript"].get<std::string>().empty();
+    }
+    return false;
+}
+
+// Atomic JSON writer: write to .tmp then rename over target
+static bool atomic_write_json_file(const std::string& path, const nlohmann::json& j) {
+    try {
+        fs::path p(path);
+        fs::path tmp = p; tmp += ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            out << j.dump(2);
+            out.flush();
+            if (!out) return false;
+        }
+        std::error_code ec;
+        fs::rename(tmp, p, ec);                 // atomic on POSIX
+        if (ec) {
+            fs::remove(p, ec);                    // best-effort remove then retry
+            ec.clear();
+            fs::rename(tmp, p, ec);
+            if (ec) return false;
+        }
+        return true;
     } catch (...) { return false; }
+}
+
+static bool has_transcript_block(const std::string& path) {
+    nlohmann::json j;
+    if (!load_json_with_retries(path, &j)) return false;
+    if (!j.contains("transcriber") || !j["transcriber"].is_object()) return false;
+
+    const auto& t = j["transcriber"];
+    if (t.contains("status") && t["status"].is_string()) {
+        std::string s = t["status"].get<std::string>();
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        if (s == "done") return true;
+    }
+    return t.contains("transcript") && t["transcript"].is_string()
+        && !t["transcript"].get<std::string>().empty();
 }
 
 // ---------------- Data passed to worker ----------------
@@ -110,35 +150,6 @@ struct SystemCtx {
           s3(std::make_unique<S3Client>(cfg.s3)),
           sftp(std::make_unique<SftpClient>(cfg.sftp)) {}
 };
-
-// ---------------- Remote links helper ---------------------
-static void add_remote_links_to_json(
-    const std::string& json_path,
-    const std::vector<nlohmann::json>& s3_links,
-    const std::vector<nlohmann::json>& sftp_links)
-{
-    if (json_path.empty()) return;
-    std::error_code fec;
-    if (!std::filesystem::exists(json_path, fec)) return;
-
-    try {
-        std::ifstream in(json_path);
-        nlohmann::json j = nlohmann::json::parse(in, /*cb*/nullptr, /*allow_exceptions*/true, /*ignore_comments*/true);
-        in.close();
-
-        // namespaced block to avoid collisions with TR fields
-        nlohmann::json& storage = j["storage_uploader"];
-        if (!storage.is_object()) storage = nlohmann::json::object();
-
-        if (!s3_links.empty())   storage["s3"]   = s3_links;
-        if (!sftp_links.empty()) storage["sftp"] = sftp_links;
-
-        std::ofstream out(json_path, std::ios::trunc);
-        out << j.dump(2);
-    } catch (const std::exception& e) {
-        SU_LOG(warning) << "[JSON] failed to add remote links: " << e.what();
-    }
-}
 
 // ---------------- Worker with async queue ----------------
 
@@ -381,14 +392,16 @@ private:
                 // Final JSON stamp AFTER uploads
                 try {
                     if (file_exists(job.json_path)) {
-                        std::ifstream in(job.json_path);
-                        nlohmann::json j = nlohmann::json::parse(in);
-                        in.close();
+                        nlohmann::json j;
+                        if (!load_json_with_retries(job.json_path, &j)) {
+                            // if unreadable mid-write, don’t blow up — just start object
+                            j = nlohmann::json::object();
+                        }
 
                         nlohmann::json& storage = j["storage_uploader"];
                         if (!storage.is_object()) storage = nlohmann::json::object();
 
-                        // Make a "files" array with s3_url / web_url for convenience
+                        // Build "files" array with s3_url / web_url
                         std::vector<nlohmann::json> files_urls;
                         for (const auto& ap : audio_files) {
                             const std::string basef = basename_of(ap);
@@ -405,18 +418,17 @@ private:
                             files_urls.push_back(std::move(f));
                         }
 
-                        // Write new-style keys
                         if (!files_urls.empty()) storage["files"] = files_urls;
                         if (!json_s3_url.empty())  storage["json_s3_url"]  = json_s3_url;
                         if (!json_web_url.empty()) storage["json_web_url"] = json_web_url;
 
-                        // status reflects audio + JSON destinations
-                        const bool json_ok = (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
+                        const bool json_ok   = (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
                         const bool upload_ok = all_ok && json_ok;
                         storage["status"] = upload_ok ? "uploaded" : "partial";
 
-                        std::ofstream out(job.json_path, std::ios::trunc);
-                        out << j.dump(2);
+                        if (!atomic_write_json_file(job.json_path, j)) {
+                            SU_LOG(warning) << "[JSON] atomic finalize write failed: " << job.json_path;
+                        }
                     } else {
                         SU_LOG(warning) << "[JSON] status file vanished before final stamp: " << job.json_path;
                     }
@@ -751,22 +763,23 @@ public:
             // --- 4) stamp JSON on disk (status="planned")
             if (cfg.upload_json && file_exists(job.json_path)) {
                 try {
-                    std::ifstream in(job.json_path);
-                    nlohmann::json j = nlohmann::json::parse(in);
-                    in.close();
+                    nlohmann::json j;
+                    if (!load_json_with_retries(job.json_path, &j)) {
+                        // if we can’t read, start a minimal object (won’t clobber other keys later)
+                        j = nlohmann::json::object();
+                    }
 
                     nlohmann::json& su = j["storage_uploader"];
                     if (!su.is_object()) su = nlohmann::json::object();
 
                     su["status"] = "planned";
-                    if (!files.empty())         su["files"]        = files;
-                    if (!json_s3_url.empty())   su["json_s3_url"]  = json_s3_url;
-                    if (!json_web_url.empty())  su["json_web_url"] = json_web_url;
+                    if (!files.empty())        su["files"]        = files;
+                    if (!json_s3_url.empty())  su["json_s3_url"]  = json_s3_url;
+                    if (!json_web_url.empty()) su["json_web_url"] = json_web_url;
 
-                    std::ofstream out(job.json_path, std::ios::trunc);
-                    out << j.dump(2);
-
-                    if (cfg.log_debug) {
+                    if (!atomic_write_json_file(job.json_path, j)) {
+                        SU_LOG(warning) << "[" << job.shortName << "] atomic write failed stamping planned";
+                    } else if (cfg.log_debug) {
                         SU_LOG(info) << "[" << job.shortName << "] stamped storage URLs (s3_url/web_url) into JSON";
                     }
                 } catch (const std::exception& e) {
