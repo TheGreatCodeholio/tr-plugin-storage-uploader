@@ -46,4 +46,7 @@ struct PluginConfig {
     std::string audio{"auto"}; // auto|m4a|wav|all
     S3Config   s3;
     SftpConfig sftp;
+
+    int wait_for_transcriber_ms{1500};
+    int json_update_window_ms{0};
 };

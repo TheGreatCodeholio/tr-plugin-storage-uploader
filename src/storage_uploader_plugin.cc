@@ -24,6 +24,7 @@
 #include <thread>
 #include <unordered_map>
 #include <memory>
+#include <chrono>
 #include <vector>
 #include <iostream>
 #include <algorithm>
@@ -60,6 +61,24 @@ static std::string to_lower_copy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+static bool has_transcript_block(const std::string& path) {
+    try {
+        if (!file_exists(path)) return false;
+        std::ifstream in(path);
+        nlohmann::json j = nlohmann::json::parse(in);
+        in.close();
+        if (!j.contains("transcriber") || !j["transcriber"].is_object()) return false;
+        const auto& t = j["transcriber"];
+        if (t.contains("status") && t["status"].is_string()) {
+            std::string s = t["status"].get<std::string>();
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            if (s == "done") return true;
+        }
+        return t.contains("transcript") && t["transcript"].is_string()
+            && !t["transcript"].get<std::string>().empty();
+    } catch (...) { return false; }
 }
 
 // ---------------- Data passed to worker ----------------
@@ -215,15 +234,21 @@ private:
             }
 
             // Prepare JSON keys/paths up-front
-            std::string s3_json_key, sftp_json_rel;
             const bool has_json = cfg.upload_json && file_exists(job.json_path);
 
+            // Grace wait for transcriber before uploading JSON
+            bool saw_transcriber_before = false;
             if (has_json) {
-                const std::string json_base = basename_of(job.json_path);
-                s3_json_key   = substitute_template(cfg.s3.prefix_template,
-                                                    job.shortName, job.startTime, json_base);
-                sftp_json_rel = substitute_template(cfg.sftp.prefix_template,
-                                                    job.shortName, job.startTime, json_base);
+                saw_transcriber_before = has_transcript_block(job.json_path);
+
+                if (!saw_transcriber_before && cfg.wait_for_transcriber_ms > 0) {
+                    const auto deadline = std::chrono::steady_clock::now()
+                                        + std::chrono::milliseconds(cfg.wait_for_transcriber_ms);
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        if (has_transcript_block(job.json_path)) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                }
             }
 
             // Retry wrapper
@@ -403,6 +428,59 @@ private:
                     // (Optional) keep legacy blocks if you still want them elsewhere
                 }
 
+                if (has_json && cfg.json_update_window_ms > 0) {
+                    const auto deadline = std::chrono::steady_clock::now()
+                                        + std::chrono::milliseconds(cfg.json_update_window_ms);
+
+                    // Capture baseline contents *after* our final stamp above
+                    std::string baseline;
+                    try {
+                        std::ifstream in(job.json_path);
+                        baseline.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                    } catch (...) {
+                        // ignore read errors; we'll just skip re-PUT if we can't read
+                    }
+
+                    // Poll for a change; if detected, re-upload JSON once
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                        std::string nowtxt;
+                        try {
+                            std::ifstream in(job.json_path);
+                            nowtxt.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                        } catch (...) {
+                            continue; // if we can't read, keep waiting within the window
+                        }
+
+                        if (nowtxt.empty() || nowtxt == baseline) continue;
+
+                        SU_LOG(info) << "[" << job.shortName << "] JSON changed during update window — re-uploading";
+
+                        // Re-PUT the updated JSON to the same planned locations.
+                        // Note: this is best-effort; it does not change all_ok.
+                        if (cfg.s3.enabled) {
+                            (void) try_with_retries(
+                                [&](std::string* e){
+                                    return sys->s3->upload_file(job.json_path, s3_json_key_planned, {}, e);
+                                },
+                                cfg.s3.max_retries,
+                                "s3 json (update)");
+                        }
+                        if (cfg.sftp.enabled) {
+                            (void) try_with_retries(
+                                [&](std::string* e){
+                                    return sys->sftp->upload_file(job.json_path, sftp_json_rel_planned, e);
+                                },
+                                cfg.sftp.max_retries,
+                                "sftp json (update)");
+                        }
+
+                        break; // one re-PUT is enough
+                    }
+                }
+
+
                 all_ok &= (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
             }
 
@@ -465,6 +543,8 @@ public:
                 pc.delete_after_upload = el.value("deleteAfterUpload", false);
                 pc.log_debug           = el.value("debug", false);
                 pc.audio               = to_lower_copy(el.value("audio", "auto"));
+                pc.wait_for_transcriber_ms = el.value("waitForTranscriberMs", 1500);
+                pc.json_update_window_ms   = el.value("jsonUpdateWindowMs", 0);
 
                 // S3 block
                 if (el.contains("s3")) {
