@@ -372,29 +372,11 @@ private:
                 bool s3_json_ok   = true;
                 bool sftp_json_ok = true;
 
-                // Actually upload the JSON now
-                if (cfg.s3.enabled) {
-                    SU_LOG(info) << "[" << job.shortName << "] S3 PUT json: key=\"" << s3_json_key_planned
-                                 << "\" url=" << json_s3_url;
-                    s3_json_ok = try_with_retries(
-                        [&](std::string* e){ return sys->s3->upload_file(job.json_path, s3_json_key_planned, {}, e); },
-                        cfg.s3.max_retries, "s3 json");
-                }
-
-                if (cfg.sftp.enabled) {
-                    SU_LOG(info) << "[" << job.shortName << "] SFTP PUT json: path=\"" << sftp_json_rel_planned
-                                 << "\" host=" << cfg.sftp.host;
-                    sftp_json_ok = try_with_retries(
-                        [&](std::string* e){ return sys->sftp->upload_file(job.json_path, sftp_json_rel_planned, e); },
-                        cfg.sftp.max_retries, "sftp json");
-                }
-
-                // Final JSON stamp AFTER uploads
                 try {
                     if (file_exists(job.json_path)) {
                         nlohmann::json j;
                         if (!load_json_with_retries(job.json_path, &j)) {
-                            // if unreadable mid-write, don’t blow up — just start object
+                            // if unreadable mid-write, start fresh (we only touch our block)
                             j = nlohmann::json::object();
                         }
 
@@ -422,9 +404,8 @@ private:
                         if (!json_s3_url.empty())  storage["json_s3_url"]  = json_s3_url;
                         if (!json_web_url.empty()) storage["json_web_url"] = json_web_url;
 
-                        const bool json_ok   = (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
-                        const bool upload_ok = all_ok && json_ok;
-                        storage["status"] = upload_ok ? "uploaded" : "partial";
+                        // Status reflects audio upload success; JSON will be PUT next.
+                        storage["status"] = all_ok ? "uploaded" : "partial";
 
                         if (!atomic_write_json_file(job.json_path, j)) {
                             SU_LOG(warning) << "[JSON] atomic finalize write failed: " << job.json_path;
@@ -434,6 +415,23 @@ private:
                     }
                 } catch (const std::exception& e) {
                     SU_LOG(warning) << "[JSON] failed to finalize: " << e.what();
+                }
+
+                // ---- Now PUT the (already-finalized) JSON exactly once ----
+                if (cfg.s3.enabled) {
+                    SU_LOG(info) << "[" << job.shortName << "] S3 PUT json: key=\"" << s3_json_key_planned
+                                 << "\" url=" << json_s3_url;
+                    (void) try_with_retries(
+                        [&](std::string* e){ return sys->s3->upload_file(job.json_path, s3_json_key_planned, {}, e); },
+                        cfg.s3.max_retries, "s3 json");
+                }
+
+                if (cfg.sftp.enabled) {
+                    SU_LOG(info) << "[" << job.shortName << "] SFTP PUT json: path=\"" << sftp_json_rel_planned
+                                 << "\" host=" << cfg.sftp.host;
+                    (void) try_with_retries(
+                        [&](std::string* e){ return sys->sftp->upload_file(job.json_path, sftp_json_rel_planned, e); },
+                        cfg.sftp.max_retries, "sftp json");
                 }
 
                 if (json_links_s3.is_object() || json_links_sftp.is_object()) {
