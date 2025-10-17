@@ -421,7 +421,7 @@ private:
                 if (cfg.s3.enabled) {
                     SU_LOG(info) << "[" << job.shortName << "] S3 PUT json: key=\"" << s3_json_key_planned
                                  << "\" url=" << json_s3_url;
-                    (void) try_with_retries(
+                    s3_json_ok = try_with_retries(
                         [&](std::string* e){ return sys->s3->upload_file(job.json_path, s3_json_key_planned, {}, e); },
                         cfg.s3.max_retries, "s3 json");
                 }
@@ -429,7 +429,7 @@ private:
                 if (cfg.sftp.enabled) {
                     SU_LOG(info) << "[" << job.shortName << "] SFTP PUT json: path=\"" << sftp_json_rel_planned
                                  << "\" host=" << cfg.sftp.host;
-                    (void) try_with_retries(
+                    sftp_json_ok = try_with_retries(
                         [&](std::string* e){ return sys->sftp->upload_file(job.json_path, sftp_json_rel_planned, e); },
                         cfg.sftp.max_retries, "sftp json");
                 }
@@ -489,7 +489,6 @@ private:
                         break; // one re-PUT is enough
                     }
                 }
-
 
                 all_ok &= (!cfg.s3.enabled || s3_json_ok) && (!cfg.sftp.enabled || sftp_json_ok);
             }
